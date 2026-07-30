@@ -8,13 +8,14 @@
 
 #!/usr/bin/env python3
 
-import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import logging
 
 import polars as pl
 import streamlit as st
 from natsort import natsorted
+
 from streamlit_autorefresh import st_autorefresh
 
 # -------------------------------------------------------------------------------------------------

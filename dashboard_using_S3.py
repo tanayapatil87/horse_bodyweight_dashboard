@@ -9,6 +9,12 @@
 #!/usr/bin/env python3
 
 import logging
+import os
+from io import BytesIO
+from urllib.parse import urlparse
+
+import boto3
+from botocore.exceptions import ClientError, NoCredentialsError
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -16,6 +22,15 @@ import polars as pl
 import streamlit as st
 from natsort import natsorted
 from streamlit_autorefresh import st_autorefresh
+
+try:
+    from dotenv import find_dotenv, load_dotenv
+except ImportError:  # pragma: no cover - fallback for environments without python-dotenv
+    def find_dotenv(*_args, **_kwargs):
+        return ""
+
+    def load_dotenv(*_args, **_kwargs):
+        return False
 
 # -------------------------------------------------------------------------------------------------
 # Data at NAS locations :
@@ -63,8 +78,89 @@ CONFIG = {
             "gtl_analytics_stage_eu_west_1_covert_001"
         ),
     },
+    "s3_bucket": {
+        "analytics": "s3://gtl-analytics-stage-eu-west-1-covert-001/",
+        "dmt": "s3://gtl.dmt-stage.eu-west-1.covert.source/",
+    },
     "lookahead_hours": 3,
 }
+
+
+s3 = boto3.client("s3")
+
+
+class S3Handler:
+    def __init__(self, profile_name="default"):
+        load_dotenv(find_dotenv())
+        self.profile_name = profile_name
+        self.storage_options = {
+            "profile": profile_name,
+            "client_kwargs": {"region_name": os.getenv("AWS_REGION", "eu-west-1")},
+        }
+        self.s3_dir = os.getenv("AWS_PATH")
+
+    def _normalize_path(self, path):
+        if not path:
+            raise ValueError("S3 path cannot be empty")
+        if isinstance(path, str) and path.startswith("s3://"):
+            return path
+        if isinstance(path, str) and self.s3_dir:
+            return f"{self.s3_dir.rstrip('/')}/{path.lstrip('/')}"
+        return path
+
+    def read_parquet(self, path):
+        normalized_path = self._normalize_path(path)
+        return pl.read_parquet(normalized_path, storage_options=self.storage_options)
+
+    def scan_parquet(self, path):
+        normalized_path = self._normalize_path(path)
+        return pl.scan_parquet(normalized_path, storage_options=self.storage_options)
+
+
+parquet_client = S3Handler(profile_name="default")
+
+
+def _parse_s3_uri(s3_uri: str) -> tuple[str, str]:
+    """Parse an s3:// URI into bucket name and key prefix."""
+    parsed = urlparse(s3_uri)
+    if parsed.scheme != "s3":
+        raise ValueError(f"Unsupported S3 URI: {s3_uri}")
+    return parsed.netloc, parsed.path.lstrip("/")
+
+
+def _build_s3_prefix(prefix_root: str, now: datetime) -> str:
+    """Build the year/month/day prefix used by the analytics and DMT parquet exports."""
+    return (
+        f"{prefix_root.rstrip('/')}/horses/merged_fields/"
+        f"year={now.year}/month={now.month:02d}/day={now.day:02d}/"
+    )
+
+
+def _load_latest_s3_parquet(bucket: str, prefix: str, label: str):
+    """Load the latest parquet file from S3, returning None when the object is unavailable."""
+    try:
+        response = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
+        files = [
+            obj
+            for obj in response.get("Contents", [])
+            if obj["Key"].endswith(".parquet") and "field" in obj["Key"].lower()
+        ]
+
+        if not files:
+            raise FileNotFoundError(f"No {label} parquet files found.")
+
+        latest_file = max(files, key=lambda obj: obj["LastModified"])
+        latest_path = f"s3://{bucket}/{latest_file['Key']}"
+        return parquet_client.read_parquet(latest_path)
+    except (NoCredentialsError, ClientError) as exc:
+        logger.warning("S3 access failed for %s: %s", label, exc)
+        return None
+    except FileNotFoundError as exc:
+        logger.warning("No parquet files found for %s: %s", label, exc)
+        return None
+    except ValueError as exc:
+        logger.warning("Unable to read parquet data for %s: %s", label, exc)
+        return None
 
 
 # -----------------------------------------------------------------------------
@@ -163,27 +259,21 @@ def check_local_results():
 @st.cache_data(ttl=60)
 def analytics_available():
     """
-    Check on Analytics S3 bucket for body weight availability.
+    Check the Analytics S3 bucket for body weight availability.
     """
 
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
-    _now = now.replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+    bucket, prefix_root = _parse_s3_uri(CONFIG["s3_bucket"]["analytics"])
+    prefix = _build_s3_prefix(prefix_root, now)
 
-    latest_dir = f"/year={_now:%Y}" f"/month={_now:%m}" f"/day={_now:%d}" f"/"
-    analytics_dir = Path(
-        CONFIG["directories"]["analytics"] + "/horses/merged_fields" + latest_dir
-    )
-
-    fields_files = natsorted(analytics_dir.glob("**/*field*.parquet"))
-    if not fields_files:
+    analytics_fields = _load_latest_s3_parquet(bucket, prefix, "analytics")
+    if analytics_fields is None:
         return pl.DataFrame(
             {
                 "RaceKey": [],
                 "AnalyticsAvailable": [],
             }
         )
-
-    analytics_fields = pl.scan_parquet(fields_files[-1])  # scan latest file
 
     return (
         analytics_fields.select(
@@ -195,22 +285,19 @@ def analytics_available():
             ]
         )
         .unique("RaceKey")
-        .collect()
     )
 
 
 def dmt_available():
     """
-    Check on DMT S3 bucket for body weight availability.
+    Check the DMT S3 bucket for body weight availability.
     """
+    now = datetime.now(timezone.utc)
+    bucket, prefix_root = _parse_s3_uri(CONFIG["s3_bucket"]["dmt"])
+    prefix = _build_s3_prefix(prefix_root, now)
 
-    now = datetime.now(timezone.utc).replace(tzinfo=None).replace(tzinfo=timezone.utc)
-
-    latest_dir = f"/year={now:%Y}" f"/month={now:%m}" f"/day={now:%d}" f"/"
-    dmt_dir = Path(CONFIG["directories"]["dmt"] + "/horses/merged_fields" + latest_dir)
-
-    fields_files = natsorted(dmt_dir.glob("**/*field*.parquet"))
-    if not fields_files:
+    dmt_fields = _load_latest_s3_parquet(bucket, prefix, "dmt")
+    if dmt_fields is None:
         return pl.DataFrame(
             {
                 "RaceKey": [],
@@ -218,17 +305,16 @@ def dmt_available():
             }
         )
 
-    dmt_fields = pl.scan_parquet(fields_files[-1])  # scan latest file
-
     return (
         dmt_fields.select(
             [
                 pl.col("RaceKey"),
-                (pl.col("HorseBodyWeight").any().over("RaceKey")).alias("DMTAvailable"),
+                (pl.col("HorseBodyWeight").any().over("RaceKey")).alias(
+                    "DMTAvailable"
+                ),
             ]
         )
         .unique("RaceKey")
-        .collect()
     )
 
 
@@ -242,30 +328,11 @@ def render_kpis(df_upcoming: pl.DataFrame):
 
     col1, col2, col3, col4, col5 = st.columns(5)
 
-    col1.metric(
-        "Upcoming Races",
-        len(df_upcoming),
-    )
-
-    col2.metric(
-        "🟢",
-        analytics_count,
-    )
-
-    col3.metric(
-        "🟡",
-        dmt_count,
-    )
-
-    col4.metric(
-        "🟠",
-        scraped_count,
-    )
-
-    col5.metric(
-        "🔴",
-        missing_count,
-    )
+    col1.metric("Upcoming Races",len(df_upcoming),)
+    col2.metric("🟢",analytics_count,)
+    col3.metric("🟡",dmt_count,)
+    col4.metric("🟠", scraped_count,)
+    col5.metric("🔴",missing_count,)
 
 
 # -----------------------------------------------------------------------------
@@ -340,170 +407,174 @@ def build_dashboard_data():
 # -----------------------------------------------------------------------------
 # STREAMLIT APP
 # -----------------------------------------------------------------------------
-_now = datetime.now(timezone.utc).replace(tzinfo=None)
-st.set_page_config(
-    page_title="Horse Racing Dashboard",
-    page_icon="🏇",
-    layout="wide",
-)
-
-st.logo("https://www.covert.jp/assets/img/ogp.png")
-st.sidebar.title("CovertAI")
-
-st.title("🏇 Horse Body Weight Monitoring")
-# Refresh every 60 seconds
-st_autorefresh(interval=60 * 1000, key="dashboard_refresh")
-
-st.caption(f"Last refreshed: {_now.strftime('%Y-%m-%d %H:%M:%S')}")
-
-
-with st.expander("About"):
-    st.write("🔴 Horse body weight is not available at the source")
-    st.write("🟠 Horse body weight is scraped and available at source")
-    st.write("🟡 Horse body weight is available on DMT S3 bucket")
-    st.write("🟢 Horse body weight is available at Analytics S3 bucket")
-    st.write("Priority: 🟢 Analytics -> 🟡 DMT -> 🟠 Scraped -> 🔴 Missing")
-
-df = build_dashboard_data()
-
-if len(df) == 0:
-    st.warning("No races found.")
-    st.stop()
-
-page = st.sidebar.radio(
-    "Select Page",
-    [
-        "Upcoming Races",
-        "Past Races",
-    ],
-)
-
-if page == "Upcoming Races":
-
-    lookahead = st.sidebar.slider(
-        "Hours Ahead",
-        min_value=1,
-        max_value=12,
-        value=CONFIG["lookahead_hours"],
+def main():
+    _now = datetime.now(timezone.utc).replace(tzinfo=None)
+    st.set_page_config(
+        page_title="Horse Racing Dashboard",
+        page_icon="🏇",
+        layout="wide",
     )
 
-    upcoming = df.filter(
-        (pl.col("RaceStartTimeUTC") >= _now)
-        & (pl.col("RaceStartTimeUTC") <= _now + timedelta(hours=lookahead))
-        & pl.col("TrackCountry").is_in(["HK", "JPN"])
+    st.logo("https://www.covert.jp/assets/img/ogp.png")
+    st.sidebar.title("CovertAI")
+
+    st.title("🏇 Horse Body Weight Monitoring")
+    # Refresh every 60 seconds
+    st_autorefresh(interval=60 * 1000, key="dashboard_refresh")
+
+    st.caption(f"Last refreshed: {_now.strftime('%Y-%m-%d %H:%M:%S')}")
+
+    with st.expander("About"):
+        st.write("🔴 Horse body weight is not available at the source")
+        st.write("🟠 Horse body weight is scraped and available at source")
+        st.write("🟡 Horse body weight is available on DMT S3 bucket")
+        st.write("🟢 Horse body weight is available at Analytics S3 bucket")
+        st.write("Priority: 🟢 Analytics -> 🟡 DMT -> 🟠 Scraped -> 🔴 Missing")
+
+    df = build_dashboard_data()
+
+    if len(df) == 0:
+        st.warning("No races found.")
+        st.stop()
+
+    page = st.sidebar.radio(
+        "Select Page",
+        [
+            "Upcoming Races",
+            "Past Races",
+        ],
     )
 
-    st.subheader("Upcoming Races")
+    if page == "Upcoming Races":
 
-    st.dataframe(
-        upcoming.select(
-            [
-                "TrackCountry",
-                "Jurisdiction",
-                "TrackName",
-                "RaceNo",
-                "RaceStartTimeUTC",
-                "MinutesToStart",
-                "BodyWeightStatus",
-                "TimeLatestUpdated",
-            ]
+        lookahead = st.sidebar.slider(
+            "Hours Ahead",
+            min_value=1,
+            max_value=12,
+            value=CONFIG["lookahead_hours"],
         )
-        .sort("MinutesToStart")
-        .to_pandas(),
-        width="stretch",
-        hide_index=True,
-    )
-    logger.info("Upcoming Races: %s", upcoming)
-    st.subheader("Filters")
 
-    jurisdictions = st.multiselect(
-        "Jurisdiction",
-        ["HK", "JRA", "NAR"],
-        default=["HK", "JRA", "NAR"],
-    )
+        upcoming = df.filter(
+            (pl.col("RaceStartTimeUTC") >= _now)
+            & (pl.col("RaceStartTimeUTC") <= _now + timedelta(hours=lookahead))
+            & pl.col("TrackCountry").is_in(["HK", "JPN"])
+        )
+
+        st.subheader("Upcoming Races")
+
+        st.dataframe(
+            upcoming.select(
+                [
+                    "TrackCountry",
+                    "Jurisdiction",
+                    "TrackName",
+                    "RaceNo",
+                    "RaceStartTimeUTC",
+                    "MinutesToStart",
+                    "BodyWeightStatus",
+                    "TimeLatestUpdated",
+                ]
+            )
+            .sort("MinutesToStart")
+            .to_pandas(),
+            width="stretch",
+            hide_index=True,
+        )
+        logger.info("Upcoming Races: %s", upcoming)
+        st.subheader("Filters")
+
+        jurisdictions = st.multiselect(
+            "Jurisdiction",
+            ["HK", "JRA", "NAR"],
+            default=["HK", "JRA", "NAR"],
+        )
+
+        # -----------------------------------------------------------------------------
+        # SUMMARY
+        # -----------------------------------------------------------------------------
+
+        upcoming_races_summary = (
+            upcoming.group_by("BodyWeightStatus").len().sort("BodyWeightStatus")
+        )
+
+        st.subheader("Total")
+
+        st.dataframe(
+            upcoming_races_summary.to_pandas(),
+            width="stretch",
+            hide_index=True,
+        )
+
+    else:
+
+        past = df.filter(pl.col("RaceStartTimeUTC") < _now)
+
+        st.subheader("Past Races")
+
+        st.dataframe(
+            past.select(
+                [
+                    "TrackCountry",
+                    "Jurisdiction",
+                    "TrackName",
+                    "RaceNo",
+                    "RaceStartTimeUTC",
+                    "MinutesSinceFinish",
+                    "BodyWeightStatus",
+                    "TimeLatestUpdated",
+                ]
+            )
+            .sort(
+                "RaceStartTimeUTC",
+                descending=True,
+            )
+            .to_pandas(),
+            width="stretch",
+            hide_index=True,
+        )
+
+        logger.info("Past Races: %s", past)
+        st.subheader("Filters")
+
+        jurisdictions = st.multiselect(
+            "Jurisdiction",
+            ["HK", "JRA", "NAR"],
+            default=["HK", "JRA", "NAR"],
+        )
+
+        # -----------------------------------------------------------------------------
+        # SUMMARY
+        # -----------------------------------------------------------------------------
+
+        past_races_summary = (
+            past.group_by("BodyWeightStatus").len().sort("BodyWeightStatus")
+        )
+
+        st.subheader("Total")
+
+        st.dataframe(
+            past_races_summary.to_pandas(),
+            width="stretch",
+            hide_index=True,
+        )
 
     # -----------------------------------------------------------------------------
     # SUMMARY
     # -----------------------------------------------------------------------------
 
-    upcoming_races_summary = (
-        upcoming.group_by("BodyWeightStatus").len().sort("BodyWeightStatus")
-    )
+    st.divider()
 
-    st.subheader("Total")
+    summary = df.group_by("BodyWeightStatus").len().sort("BodyWeightStatus")
+
+    st.subheader("All Races Summary")
+    st.caption("Summary of body weight availability for all upcoming and past races")
 
     st.dataframe(
-        upcoming_races_summary.to_pandas(),
+        summary.to_pandas(),
         width="stretch",
         hide_index=True,
     )
 
-else:
 
-    past = df.filter(pl.col("RaceStartTimeUTC") < _now)
-
-    st.subheader("Past Races")
-
-    st.dataframe(
-        past.select(
-            [
-                "TrackCountry",
-                "Jurisdiction",
-                "TrackName",
-                "RaceNo",
-                "RaceStartTimeUTC",
-                "MinutesSinceFinish",
-                "BodyWeightStatus",
-                "TimeLatestUpdated",
-            ]
-        )
-        .sort(
-            "RaceStartTimeUTC",
-            descending=True,
-        )
-        .to_pandas(),
-        width="stretch",
-        hide_index=True,
-    )
-
-    logger.info("Past Races: %s", past)
-    st.subheader("Filters")
-
-    jurisdictions = st.multiselect(
-        "Jurisdiction",
-        ["HK", "JRA", "NAR"],
-        default=["HK", "JRA", "NAR"],
-    )
-
-    # -----------------------------------------------------------------------------
-    # SUMMARY
-    # -----------------------------------------------------------------------------
-
-    past_races_summary = (
-        past.group_by("BodyWeightStatus").len().sort("BodyWeightStatus")
-    )
-
-    st.subheader("Total")
-
-    st.dataframe(
-        past_races_summary.to_pandas(),
-        width="stretch",
-        hide_index=True,
-    )
-
-# -----------------------------------------------------------------------------
-# SUMMARY
-# -----------------------------------------------------------------------------
-
-st.divider()
-
-summary = df.group_by("BodyWeightStatus").len().sort("BodyWeightStatus")
-
-st.subheader("All Races Summary")
-st.caption("Summary of body weight availability for all upcoming and past races")
-
-st.dataframe(
-    summary.to_pandas(),
-    width="stretch",
-    hide_index=True,
-)
+if __name__ == "__main__":
+    main()
