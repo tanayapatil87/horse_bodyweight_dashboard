@@ -8,15 +8,17 @@
 
 #!/usr/bin/env python3
 
+import logging
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-import logging
 
 import polars as pl
 import streamlit as st
 from natsort import natsorted
-
 from streamlit_autorefresh import st_autorefresh
+
+from dashboard_refresh_policy import should_refresh
 
 # -------------------------------------------------------------------------------------------------
 # Data at NAS locations :
@@ -37,13 +39,15 @@ from streamlit_autorefresh import st_autorefresh
 # horses/merged_fields/
 # -------------------------------------------------------------------------------------------------
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    stream=sys.stdout,
+    force=True,
+)
 logger = logging.getLogger(__name__)
-logger.handlers.clear()
 logger.setLevel(logging.INFO)
-handler = logging.StreamHandler()
-formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-handler.setFormatter(formatter)
-logger.addHandler(handler)
+logger.propagate = True
 
 CONFIG = {
     "directories": {
@@ -65,7 +69,20 @@ CONFIG = {
         ),
     },
     "lookahead_hours": 3,
+    "refresh_interval_seconds": 60,
 }
+
+
+def get_dashboard_data() -> pl.DataFrame:
+    """Rebuild the dashboard data only after the configured refresh interval."""
+    now = datetime.now(timezone.utc)
+    last_refresh = st.session_state.get("dashboard_last_refresh")
+
+    if should_refresh(last_refresh, now, CONFIG["refresh_interval_seconds"]):
+        st.session_state["dashboard_data"] = build_dashboard_data()
+        st.session_state["dashboard_last_refresh"] = now
+
+    return st.session_state.get("dashboard_data", pl.DataFrame())
 
 
 # -----------------------------------------------------------------------------
@@ -83,12 +100,14 @@ def load_latest_fields():
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     fields_dir = Path(CONFIG["directories"]["fields"])
 
-    fields_files = natsorted(fields_dir.glob("**/*field*.parquet"))
+    fields_files = natsorted(fields_dir.glob("**/*fields_extraction_gallop*.parquet"))
 
     if not fields_files:
+        logger.warning("No field files found in %s", fields_dir)
         return pl.DataFrame()
 
     latest_fields = fields_files[-1]
+    logger.info("Loading latest fields from local file: %s", latest_fields)
 
     df_latest_fields = (
         pl.scan_parquet(latest_fields)
@@ -114,13 +133,22 @@ def load_latest_fields():
             (now - pl.col("RaceStartTimeUTC"))
             .dt.total_minutes()
             .alias("MinutesSinceFinish"),
-        )
-        .filter(
-            pl.col.TrackCountry.is_in(("HK", "JPN")),
-            (pl.col.RaceStartTimeUTC - now) <= pl.duration(hours=3),
-        )
-        .collect()
+        ).collect()
     )
+    if df_latest_fields.is_empty():
+        logger.warning("No races found.")
+    else:
+        df_latest_fields = (df_latest_fields.filter(
+            pl.col.TrackCountry.is_in(("HK", "JPN")))
+            )
+        if len(df_latest_fields) == 0:
+            logger.warning("No races for HK/JPN found")
+        else:
+            df_latest_fields = (df_latest_fields.filter(
+                (pl.col.RaceStartTimeUTC - now) <= pl.duration(hours=3))
+                )
+            if df_latest_fields.is_empty():
+                logger.warning("No upcoming races found")
 
     return df_latest_fields
 
@@ -136,6 +164,7 @@ def check_local_results():
     latest_file = local_dir / "nar" / "outputs" / "latest.parquet"
 
     if not latest_file.exists():
+        logger.warning("Latest local results file not found in %s", latest_file)
         return pl.DataFrame(
             {
                 "RaceKey": [],
@@ -177,6 +206,7 @@ def analytics_available():
 
     fields_files = natsorted(analytics_dir.glob("**/*field*.parquet"))
     if not fields_files:
+        logger.warning("No analytics field files found in %s", analytics_dir)
         return pl.DataFrame(
             {
                 "RaceKey": [],
@@ -279,8 +309,9 @@ def build_dashboard_data():
     """Build the main dashboard dataframe by joining fields, local results,
     DMT availability, and Analytics availability.
     """
-
+    logger.info("Building dashboard data")
     df_fields = load_latest_fields()
+    logger.info("Fields: %s", False if df_fields.is_empty() else True)
     if len(df_fields) == 0:
         return df_fields
 
@@ -288,7 +319,6 @@ def build_dashboard_data():
     df_dmt = dmt_available()
     df_local = check_local_results()
 
-    logger.info("Fields: %s", False if df_fields.is_empty() else True)
     logger.info("Analytics: %s", False if df_analytics.is_empty() else True)
     logger.info("DMT: %s", False if df_dmt.is_empty() else True)
     logger.info("Local: %s\n", False if df_local.is_empty() else True)
@@ -342,6 +372,7 @@ def build_dashboard_data():
 # STREAMLIT APP
 # -----------------------------------------------------------------------------
 _now = datetime.now(timezone.utc).replace(tzinfo=None)
+logger.info("Dashboard startup: initializing Streamlit page")
 st.set_page_config(
     page_title="Horse Racing Dashboard",
     page_icon="🏇",
@@ -355,7 +386,11 @@ st.title("🏇 Horse Body Weight Monitoring")
 # Refresh every 60 seconds
 st_autorefresh(interval=60 * 1000, key="dashboard_refresh")
 
-st.caption(f"Last refreshed: {_now.strftime('%Y-%m-%d %H:%M:%S')}")
+last_refresh = st.session_state.get("dashboard_last_refresh")
+if last_refresh is None:
+    last_refresh = datetime.now(timezone.utc)
+
+st.caption(f"Last refreshed: {last_refresh.strftime('%Y-%m-%d %H:%M:%S')}")
 
 
 with st.expander("About"):
@@ -365,7 +400,7 @@ with st.expander("About"):
     st.write("🟢 Horse body weight is available at Analytics S3 bucket")
     st.write("Priority: 🟢 Analytics -> 🟡 DMT -> 🟠 Scraped -> 🔴 Missing")
 
-df = build_dashboard_data()
+df = get_dashboard_data()
 
 if len(df) == 0:
     st.warning("No races found.")
