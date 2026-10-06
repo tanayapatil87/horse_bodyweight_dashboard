@@ -1,0 +1,19 @@
+services:
+  dashboard:
+    build: .
+    container_name: horse-bodyweight-dashboard
+    ports:
+      - "8501:8501"
+    volumes:
+      - .:/app
+      - /mnt/nas:/mnt/nas
+    command: >
+      streamlit run dashboard.py
+      --server.address=0.0.0.0
+      --server.port=8501
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "5"
